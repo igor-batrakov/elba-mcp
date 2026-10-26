@@ -26,12 +26,14 @@ from pathlib import Path
 
 try:
     import fcntl
-except ImportError:  # Windows: журнал без блокировки
+    msvcrt = None
+except ImportError:  # Windows
     fcntl = None
+    import msvcrt
 
 from mcp.server.mcpserver import MCPServer
 
-__version__ = "0.1.0"  # единственное место версии: pyproject.toml читает её отсюда
+__version__ = "0.1.1"  # единственное место версии: pyproject.toml читает её отсюда
 
 BASE = "https://elba-api.kontur.ru/v1"
 HERE = Path(__file__).resolve().parent
@@ -47,7 +49,7 @@ def _env(name: str) -> str | None:
         return os.environ[name]
     env = HERE / ".env"
     if env.exists():
-        for line in env.read_text().splitlines():
+        for line in env.read_text(encoding="utf-8").splitlines():
             k, sep, v = line.partition("=")
             if sep and k.strip() == name:
                 return v.strip().strip("'\"")
@@ -143,12 +145,34 @@ def _items(items: list[dict], nds_rate: str | None, upd: bool = False) -> list[d
 @contextmanager
 def _locked(name: str):
     """Блокировка между процессами: сервер запущен в каждой сессии Claude, и работают они параллельно."""
-    if not fcntl:  # без блокировки две сессии создадут два одинаковых документа — лучше отказ
-        raise ElbaError("нет fcntl (Windows): журнал и защита от дублей без блокировки не поддерживаются")
+    if not fcntl and not msvcrt:  # без блокировки две сессии создадут два одинаковых документа — лучше отказ
+        raise ElbaError("нет ни fcntl, ни msvcrt: журнал и защита от дублей без блокировки не поддерживаются")
     STATE.mkdir(parents=True, exist_ok=True)
-    with open(STATE / name, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
+    with open(STATE / name, "a+") as lock:
+        if fcntl:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+            return
+        _win_lock(lock)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def _win_lock(lock, timeout: float = 300) -> None:
+    """msvcrt.LK_LOCK ждёт всего 10 с, а операция с несколькими запросами к API бывает дольше — ждём сами."""
+    deadline = time.monotonic() + timeout
+    while True:
+        lock.seek(0)
+        try:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError:
+            if time.monotonic() > deadline:
+                raise ElbaError(f"журнал занят другой сессией дольше {timeout:.0f} с") from None
+            time.sleep(0.1)
 
 
 def _exclusive():
@@ -162,12 +186,13 @@ def _journal():
     """Журнал счетов организации. Ведётся здесь, потому что API Эльбы не отдаёт список счетов — только по id."""
     path = STATE / f"journal-{_org()}.json"
     with _locked("journal.lock"):
-        data = json.loads(path.read_text()) if path.exists() else {}
+        # кодировка явно: на Windows по умолчанию cp1252, и русское имя клиента уронило бы запись
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         data.setdefault("bills", {})
         data.setdefault("news_offset", None)
         yield data
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(tmp, path)
 
 
@@ -225,6 +250,38 @@ def _news(org: str, offset: int) -> list[dict]:
         if len(batch) < 1000:
             return news
         offset = batch[-1]["id"] + 1  # offset — id новости, с которой читать
+
+
+def _latest_payments(org: str) -> dict:
+    """Последняя новость об оплате по каждому счёту — его текущая оплаченная сумма."""
+    return {n["newsContent"]["billId"]: n["newsContent"]
+            for n in _news(org, 0) if n.get("newsType") == "billPaymentNews"}
+
+
+def _paid(entry: dict, latest: dict) -> float | None:
+    """Оплаченная часть счёта из журнала: None — узнать нельзя."""
+    status = entry.get("status")
+    if status == "paid":  # переплата видна по ленте; устаревшая частичная новость меньше суммы счёта
+        total, rel = entry.get("total"), latest.get(entry["id"], {}).get("relatedPaymentsSum")
+        return rel if total is None else (total if rel is None else max(total, rel))
+    if status == "notPaid":
+        return 0
+    if entry["id"] in latest:
+        return latest[entry["id"]]["relatedPaymentsSum"]
+    # оплат по счёту в ленте не было: просрочен без оплат — 0, частичная оплата без новости — неизвестно
+    return 0 if status == "overdue" else None
+
+
+def _merge_fresh(entry: dict, bill: dict) -> None:
+    """Реквизиты строки — из свежего ответа: запись журнала в elba_get_bill могла не пройти."""
+    if bill.get("contractorId") != entry.get("contractorId"):
+        entry.pop("contractor", None)
+    entry.update(number=bill.get("number"), date=(bill.get("date") or "")[:10] or None,
+                 contractorId=bill.get("contractorId"), total=bill["total"], status=bill.get("status"))
+
+
+def _sum(values: list) -> float | None:
+    return round(sum(values), 2) if all(v is not None for v in values) else None
 
 
 mcp = MCPServer("elba", version=__version__)
@@ -387,9 +444,7 @@ def elba_unpaid(recheck_all: bool = False) -> dict:
     Оплаченные и отменённые перечитываются, если лента расходится с журналом; recheck_all=true — все.
     Возвращает счета (номер, клиент, проект, сумма, оплачено, дней с даты счёта, ссылка) и общий долг;
     debt — null, если хоть одна сумма неизвестна или счёт не перечитался."""
-    org = _org()
-    latest = {n["newsContent"]["billId"]: n["newsContent"]  # последняя новость по счёту — текущая оплата
-              for n in _news(org, 0) if n.get("newsType") == "billPaymentNews"}
+    latest = _latest_payments(_org())
     with _journal() as j:
         ids = [bid for bid, e in j["bills"].items()
                if recheck_all or e.get("status") not in ("paid", "rejected")
@@ -404,22 +459,12 @@ def elba_unpaid(recheck_all: bool = False) -> dict:
         entries = {bid: dict(j["bills"][bid]) for bid in ids if bid in j["bills"]}
     rows = []
     for bid, e in entries.items():
-        b = fresh.get(bid)
-        if b:  # реквизиты — из свежего ответа: запись журнала в elba_get_bill могла не пройти
-            if b.get("contractorId") != e.get("contractorId"):
-                e.pop("contractor", None)
-            e.update(number=b.get("number"), date=(b.get("date") or "")[:10] or None,
-                     contractorId=b.get("contractorId"), total=b["total"], status=b.get("status"))
+        if fresh.get(bid):
+            _merge_fresh(e, fresh[bid])
         if e.get("status") not in ("paid", "rejected"):
             rows.append({"id": bid, **e})
     for r in rows:
-        p = latest.get(r["id"])
-        if r.get("status") == "notPaid":
-            r["paid"] = 0
-        elif p:
-            r["paid"] = p["relatedPaymentsSum"]
-        else:  # оплат по счёту в ленте не было: просрочен без оплат — 0, частичная оплата без новости — неизвестно
-            r["paid"] = 0 if r.get("status") == "overdue" else None
+        r["paid"] = _paid(r, latest)
         if r.get("date"):
             r["days"] = (date.today() - date.fromisoformat(r["date"])).days
     rows.sort(key=lambda r: r.get("date") or "")
@@ -427,6 +472,57 @@ def elba_unpaid(recheck_all: bool = False) -> dict:
     return {
         "bills": rows,
         "debt": round(sum(r["total"] - r["paid"] for r in rows), 2) if known else None,
+        "errors": errors,
+    }
+
+
+@mcp.tool()
+def elba_report(
+    project: str | None = None,
+    contractor_id: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict:
+    """Сводка по журналу счетов: сколько выставлено, оплачено и не оплачено, сколько счетов закрыто актом или УПД —
+    всего и по проектам, плюс список счетов (по нему же счёт находят по номеру).
+    Фильтры: project, contractor_id, date_from и date_to (ГГГГ-ММ-ДД, по дате счёта). Отменённые не считаются.
+    Статусы — из журнала; счета, у которых лента оплат с журналом расходится, перечитываются из Эльбы.
+    Оплаченная часть — из ленты. Суммы null, если какую-то узнать не удалось; errors — счета, что не перечитались.
+    byProject — список, project null — счета без проекта."""
+    latest = _latest_payments(_org())
+    with _journal() as j:
+        rows = [{"id": bid, **e} for bid, e in j["bills"].items()]
+    errors = []
+    for r in rows:
+        p = latest.get(r["id"])
+        # оплату провели или отвязали, счёт изменили после записи в журнал
+        if p and (p["billStatus"] != r.get("status") or p["billSum"] != r.get("total")):
+            try:
+                _merge_fresh(r, elba_get_bill(r["id"]))
+            except ElbaError as e:
+                errors.append({"id": r["id"], "error": str(e)})
+                r["stale"] = True
+    rows = [r for r in rows
+            if (r.get("stale") or r.get("status") != "rejected")  # неперечитанный «отменён» мог ожить
+            and (project is None or r.get("project") == project)
+            and (contractor_id is None or r.get("contractorId") == contractor_id)
+            and (not date_from or (r.get("date") or "") >= date_from)
+            and (not date_to or (r.get("date") or "9999") <= date_to)]
+    for r in rows:
+        r["paid"] = None if r.get("stale") else _paid(r, latest)
+    rows.sort(key=lambda r: r.get("date") or "")
+
+    def summary(part: list[dict]) -> dict:
+        billed, paid = _sum([r.get("total") for r in part]), _sum([r["paid"] for r in part])
+        return {"bills": len(part), "billed": billed, "paid": paid,
+                "unpaid": round(billed - paid, 2) if billed is not None and paid is not None else None,
+                "withAct": sum(1 for r in part if r.get("act")), "withUpd": sum(1 for r in part if r.get("upd"))}
+
+    projects = sorted({r.get("project") for r in rows}, key=lambda p: (p is None, p or ""))
+    return {
+        "total": summary(rows),
+        "byProject": [{"project": p, **summary([r for r in rows if r.get("project") == p])} for p in projects],
+        "bills": rows,
         "errors": errors,
     }
 
@@ -630,10 +726,166 @@ def elba_document_link(document_id: str, with_signatures: bool = True, qr_paymen
         with _journal() as j:
             entry = j["bills"].get(document_id)
             if entry is not None and res.get("url"):
-                entry["link"] = res["url"]
+                entry.update(link=res["url"], linkId=res.get("id"), linkPublished=True)
     except Exception:
         pass  # ссылка важнее журнала
     return res
+
+
+def _link_id(url: str | None) -> str | None:
+    """id ссылки — 32 hex в конце её адреса (…/Documents/<id>); нужен для записей журнала без linkId."""
+    tail = (url or "").rstrip("/").rsplit("/", 1)[-1].lower()
+    if len(tail) != 32 or any(c not in "0123456789abcdef" for c in tail):
+        return None
+    return f"{tail[:8]}-{tail[8:12]}-{tail[12:16]}-{tail[16:20]}-{tail[20:]}"
+
+
+@mcp.tool()
+def elba_link_publish(
+    document_id: str | None = None,
+    link_id: str | None = None,
+    published: bool = False,
+    with_signatures: bool = True,
+    qr_payment: bool = True,
+) -> dict:
+    """Снять публичную ссылку с публикации (published=false, по умолчанию) или вернуть её (published=true).
+    Снимать, когда счёт отменён: иначе клиент откроет и оплатит его по старой ссылке.
+    link_id — из elba_document_link; для счёта из журнала достаточно document_id.
+    API не отдаёт текущие настройки ссылки, поэтому with_signatures и qr_payment задаются заново."""
+    entry = _tracked(document_id) if document_id else None
+    link_id = link_id or (entry and (entry.get("linkId") or _link_id(entry.get("link"))))
+    if not link_id:
+        raise ElbaError("не знаю id ссылки: укажите link_id (его вернул elba_document_link)")
+    body = {"isPublished": published, "withSignatures": with_signatures, "isQrCodeEnabled": qr_payment}
+    _request("PUT", f"/organizations/{_org()}/document-links/{link_id}", body)
+    out = {"linkId": link_id, "published": published}
+    if entry is not None:
+        try:
+            with _journal() as j:
+                j["bills"][document_id].update(linkId=link_id, linkPublished=published)
+        except Exception as e:
+            out["journalWarning"] = f"ссылка изменена, журнал — нет: {e}"
+    return out
+
+
+@mcp.tool()
+def elba_repeat_bill(
+    bill_id: str,
+    bill_date: str | None = None,
+    items: list[dict] | None = None,
+    comment: str | None = None,
+    number: str | None = None,
+    allow_duplicate: bool = False,
+) -> dict:
+    """Новый счёт по образцу прошлого: тот же клиент, позиции, НДС, банковский счёт, шаблон и проект.
+    items — заменить позиции (формат elba_create_bill). Без items позиции копируются — проверьте названия:
+    в них может остаться прошлый месяц. bill_date — по умолчанию сегодня. Дубли ловятся как в elba_create_bill."""
+    bill = _request("GET", f"/organizations/{_org()}/bills/{bill_id}")[1]
+    src = bill.get("warehouseItems") or []
+    if items is not None and bill.get("withNDS") and any(not it.get("nds_rate") for it in items):
+        # иначе _items подставит nds22 вместо ставки образца
+        rates = {i.get("ndsRate") for i in src}
+        if len(rates) != 1 or None in rates:
+            raise ElbaError("в образце ставки НДС разные или неизвестны — укажите nds_rate у каждой позиции")
+        rate = rates.pop()
+        items = [{**it, "nds_rate": it.get("nds_rate") or rate} for it in items]
+    if items is None:
+        # скидки и цены с НДС внутри elba_create_bill не передаёт — копия разошлась бы с образцом по сумме
+        if bill.get("withDiscount") or bill.get("sumsWithNds") or any(i.get("discount") for i in src):
+            raise ElbaError("в счёте скидка или цены с НДС внутри — передайте items явно")
+        # неизвестное количество или ставка иначе молча станут 1 и nds22
+        need = ("productName", "quantity", "price") + (("ndsRate",) if bill.get("withNDS") else ())
+        if any(i.get(k) is None for i in src for k in need):
+            raise ElbaError(f"Эльба вернула позиции без {', '.join(need)} — передайте items явно")
+        items = [{k: v for k, v in {
+            "name": i.get("productName"), "unit": i.get("unitName"), "quantity": i.get("quantity"),
+            "price": i.get("price"), "nds_rate": i.get("ndsRate") if bill.get("withNDS") else None,
+        }.items() if v is not None} for i in src]
+    if not items:
+        raise ElbaError(f"в счёте {bill_id} нет позиций")
+    project = (_tracked(bill_id) or {}).get("project")
+    with _exclusive():
+        return _create_bill(bill.get("contractorId"), items, bill_date, number, comment, bool(bill.get("withNDS")),
+                            bill.get("bankAccountId"), bill.get("templateId"), project, allow_duplicate)
+
+
+def _fns(req: urllib.request.Request) -> dict:
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise ElbaError(f"ФНС: HTTP {e.code}") from None
+    except (OSError, ValueError) as e:
+        raise ElbaError(f"ФНС: {type(e).__name__} {e}") from None
+
+
+@mcp.tool()
+def elba_lookup_inn(inn: str) -> list[dict]:
+    """Реквизиты организации или ИП по ИНН из ЕГРЮЛ/ЕГРИП ФНС (egrul.nalog.ru, без ключа):
+    полное и краткое название, КПП, ОГРН, руководитель, дата регистрации, дата прекращения деятельности.
+    Адреса поиск ФНС не отдаёт. Для elba_create_contractor: name — полное название, short_name — краткое.
+    Сверьте с реквизитами от клиента; terminated — деятельность прекращена, счёт такому лицу выставлять нельзя."""
+    inn = inn.strip()
+    if not inn.isdigit() or len(inn) not in (10, 12):
+        raise ElbaError("ИНН — 10 цифр у организации, 12 у ИП")
+    headers = {"User-Agent": f"elba-mcp/{__version__}", "Accept": "application/json"}
+    first = _fns(urllib.request.Request("https://egrul.nalog.ru/", method="POST", headers=headers,
+                                        data=urllib.parse.urlencode({"query": inn}).encode()))
+    if first.get("captchaRequired") or not first.get("t"):
+        raise ElbaError("ФНС просит капчу — повторите позже или возьмите реквизиты у клиента")
+    for attempt in range(5):  # результат готовится на стороне ФНС, обычно сразу
+        res = _fns(urllib.request.Request(f"https://egrul.nalog.ru/search-result/{first['t']}", headers=headers))
+        if "rows" in res:
+            break
+        time.sleep(0.5)
+    else:
+        raise ElbaError("ФНС не вернула результат поиска")
+    return [{k: v for k, v in {
+        "name": r.get("n"), "shortName": r.get("c"), "inn": r.get("i"), "kpp": r.get("p"), "ogrn": r.get("o"),
+        "type": "ИП" if r.get("k") == "fl" else "организация", "head": r.get("g"), "registered": r.get("r"),
+        "region": r.get("rn"), "terminated": r.get("e"),
+    }.items() if v} for r in res["rows"] if r.get("i") == inn]
+
+
+@mcp.prompt(title="Выставить счёт")
+def elba_invoice(client: str, work: str, amount: str) -> str:
+    """Порядок выставления счёта клиенту со ссылкой и черновиком письма."""
+    return f"""Выстави счёт в Контур.Эльбе. Клиент: {client}. Работы: {work}. Сумма: {amount}.
+
+1. Найди клиента: elba_find_contractor по ИНН, иначе по названию; несколько совпадений — спроси, какой.
+   Клиента нет — elba_lookup_inn по ИНН, покажи реквизиты и после подтверждения elba_create_contractor.
+2. Шаблон — elba_templates; неясно, какой подходит, — спроси.
+3. До создания покажи клиента, позиции, сумму, НДС, дату и шаблон и дождись подтверждения.
+4. elba_create_bill с project (сайт или проект клиента); сверь номер и total с суммой.
+5. elba_document_link — ссылка для клиента.
+6. Письмо со ссылкой — только черновиком, если есть почтовый инструмент; сам не отправляй.
+   Адрес — из elba_get_contractor."""
+
+
+@mcp.prompt(title="Закрыть работы по счёту")
+def elba_close_work(bill: str, document: str = "акт") -> str:
+    """Акт или УПД по выставленному счёту и ссылка для клиента."""
+    return f"""Закрой работы по счёту {bill} документом: {document}.
+
+1. Найди счёт: elba_report (поле bills) по номеру или id; нет в журнале — спроси id и добавь elba_track_bill.
+2. elba_get_bill: не оплачен — предупреди об этом.
+3. До создания покажи клиента, позиции, сумму, основание (счёт № от) и дату документа (по умолчанию сегодня)
+   и дождись подтверждения — всегда, даже если счёт оплачен.
+4. Акт — elba_act_from_bill, УПД — elba_upd_from_bill. Уже создан — второй не делай, скажи об этом.
+5. elba_document_link на новый документ.
+6. Письмо со ссылкой — только черновиком, сам не отправляй."""
+
+
+@mcp.prompt(title="Напомнить должникам")
+def elba_remind_debtors(min_days: int = 7) -> str:
+    """Черновики напоминаний по неоплаченным счетам."""
+    return f"""Подготовь напоминания по неоплаченным счетам старше {min_days} дн.
+
+1. elba_payment_news — что оплачено с прошлой проверки; elba_unpaid — кто должен.
+2. Для каждого счёта с days ≥ {min_days}: контакт — elba_get_contractor; остаток — total − paid;
+   ссылка — link из elba_unpaid (нет — elba_document_link).
+3. Вежливый черновик письма: номер и дата счёта, остаток, ссылка на оплату. Только черновики, не отправляй.
+4. Итог списком: клиент, счёт, остаток, дней, подготовлен ли черновик."""
 
 
 def _cli(argv: list[str]) -> None:
@@ -642,7 +894,7 @@ def _cli(argv: list[str]) -> None:
     fn = globals().get(argv[1])
     if not callable(fn) or not argv[1].startswith("elba_"):
         sys.exit(f"нет инструмента {argv[1]}")
-    args = json.loads(Path(argv[2]).read_text()) if len(argv) > 2 else {}
+    args = json.loads(Path(argv[2]).read_text(encoding="utf-8")) if len(argv) > 2 else {}
     try:
         print(json.dumps(fn(**args), ensure_ascii=False, indent=2))
     except ElbaError as e:

@@ -1,0 +1,24 @@
+name: release
+
+# Тег vX.Y.Z → тесты → сборка → PyPI через Trusted Publishing (без токена).
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Тег совпадает с __version__
+        run: |
+          v=$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' elba_mcp.py)
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "тег $GITHUB_REF_NAME, а __version__ = $v"; exit 1; }
+      - run: uv run --locked pytest -q
+      - run: uv build
+      - run: uv publish --trusted-publishing always
